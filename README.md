@@ -2,7 +2,7 @@
 
 A small Linux command-line app that turns one physical keyboard connected to your server into a Bluetooth Classic HID keyboard. It forwards real key presses to a compatible paired phone, computer, tablet or TV. No companion app is required on the receiving device.
 
-**Version 0.2 — hardware validation pending.** Intended for Debian/Ubuntu with BlueZ 5 and a Bluetooth Classic (BR/EDR) capable adapter. Not a BLE-only keyboard, Windows or macOS server app. No Samsung-specific control protocol is implemented.
+**Version 0.3 — hardware validation pending.** Intended for Debian/Ubuntu with BlueZ 5 and a Bluetooth Classic (BR/EDR) capable adapter. Not a BLE-only keyboard, Windows or macOS server app. No Samsung-specific control protocol is implemented.
 
 ## Behavior
 
@@ -42,11 +42,11 @@ Confirm that the controller supports BR/EDR. For a reliable keyboard path, use:
 ls -l /dev/input/by-id/*-event-kbd
 ```
 
-Choose the entry that matches the intended keyboard; otherwise use an event device from `--list`. Event numbers can change after reboot. The app does not grab all input devices. Keep an SSH session open for recovery.
+For a manual override, choose the entry that matches the intended keyboard; otherwise use an event device from `--list`. Event numbers can change after reboot. The app does not grab all input devices. Keep an SSH session open for recovery.
 
-### Upgrade from 0.1
+### Upgrade from an earlier version
 
-Replace the old repository contents with the 0.2 release, then on the server stop the old app (Ctrl+C in its SSH terminal), and run:
+Replace the old repository contents with the 0.3 release, then on the server stop the old app (Ctrl+C in its SSH terminal), and run:
 
 ```sh
 cd ServerKeyZ
@@ -54,7 +54,7 @@ git pull
 sudo ./install.sh
 ```
 
-Relaunch using the same `--device` and optional `--peer` arguments. Existing BlueZ pairing and configuration are not changed by the installer.
+Relaunch with `sudo serverkeyz`; optional `--device` and `--peer` arguments are still supported. Existing BlueZ pairing and configuration are not changed by the installer.
 
 ## 2. Bluetooth setup (Classic HID conflict)
 
@@ -101,11 +101,13 @@ On a dedicated adapter, `btmgmt --index hci0 class 5 64` may help a host identif
 
 ## 3. Start and pair
 
-In an SSH terminal (replace the example keyboard path with yours):
+In an SSH terminal:
 
 ```sh
-sudo serverkeyz --device /dev/input/event3
+sudo serverkeyz
 ```
+
+The app automatically selects a unique built-in PS/2 keyboard, or a single eligible physical keyboard if no built-in PS/2 keyboard is found. If several keyboards are present and there is no unique built-in PS/2 keyboard, it asks you to select one using `--device`. To override automatic selection, use `sudo serverkeyz --device /dev/input/event3` with your own path.
 
 The app registers the HID service, but does not make the adapter discoverable itself. In a second SSH terminal, use the interactive BlueZ shell:
 
@@ -132,10 +134,10 @@ quit
 For normal use, restart the app with the known host address:
 
 ```sh
-sudo serverkeyz --device /dev/input/event3 --peer AA:BB:CC:DD:EE:FF
+sudo serverkeyz --peer AA:BB:CC:DD:EE:FF
 ```
 
-Replace both examples. Connect from the host Bluetooth settings. `REMOTE MODE` in the server terminal confirms both HID channels opened and keyboard capture succeeded. Release all physical keys during activation. Press Super+Ctrl+Alt+backslash on the selected physical keyboard to toggle to local mode. Release the keys, then press the same shortcut again to return to Bluetooth mode. The app stays running in both modes. To quit completely, press Ctrl+C in the launching SSH terminal.
+Replace the example host MAC. Connect from the host Bluetooth settings. `REMOTE MODE` in the server terminal confirms both HID channels opened and keyboard capture succeeded. Release all physical keys during activation. Press Super+Ctrl+Alt+backslash on the selected physical keyboard to toggle to local mode. Release the keys, then press the same shortcut again to return to Bluetooth mode. The app stays running in both modes. To quit completely, press Ctrl+C in the launching SSH terminal.
 
 ## Troubleshooting / limitations
 
@@ -152,7 +154,7 @@ Replace both examples. Connect from the host Bluetooth settings. `REMOTE MODE` i
 python3 -m unittest discover -s tests -v
 ```
 
-These test report encoding, release packets, SDP XML, both shortcut directions, held-key suppression and disconnect disarming without Bluetooth hardware. Real adapter pairing, host compatibility and latency still need on-device testing. First test with a harmless text editor on a compatible host and SSH available, including both shortcut directions, held keys, and disconnect/reconnect recovery.
+These test automatic keyboard selection, report encoding, release packets, SDP XML, both shortcut directions, held-key suppression and disconnect disarming without Bluetooth hardware. Real adapter pairing, host compatibility and latency still need on-device testing. First test with a harmless text editor on a compatible host and SSH available, including both shortcut directions, held keys, and disconnect/reconnect recovery.
 
 ## Technical references
 

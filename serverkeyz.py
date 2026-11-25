@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Forward one explicitly selected Linux keyboard to a paired Bluetooth HID host."""
+"""Forward one automatically detected or explicitly selected Linux keyboard to a paired Bluetooth HID host."""
 import argparse, os, re, select, signal, socket, sys, time
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from xml.sax.saxutils import quoteattr
 from hid import REPORT_MAP, State, reports
 
@@ -202,10 +202,46 @@ def run(args, keyboard, dbus, GLib):
                 if not grabbed: raise
                 close_session(disconnected=True)
 
+def suitable(d):
+    keys = set(d.capabilities().get(1, []))
+    return (30 in keys and 43 in keys and bool(keys & {29,97})
+            and bool(keys & {56,100}) and bool(keys & {125,126}))
+
+
+def find_keyboards(evdev):
+    """Return eligible physical keyboards; ignore virtual devices and races."""
+    candidates = []
+    for path in sorted(evdev.list_devices()):
+        sysfs = os.path.realpath('/sys/class/input/' + os.path.basename(path))
+        if '/devices/virtual/' in sysfs:
+            continue
+        try:
+            with closing(evdev.InputDevice(path)) as d:
+                if suitable(d):
+                    candidates.append((path, d.name, d.phys or ''))
+        except OSError as e:
+            print(f'Cannot inspect {path}: {e}', file=sys.stderr)
+    return candidates
+
+
+def choose_keyboard(candidates):
+    """Prefer a unique internal PS/2 keyboard, else a unique physical one."""
+    if not candidates:
+        raise RuntimeError('No eligible keyboard found. Run sudo serverkeyz --list.')
+    internal = [d for d in candidates if d[2].startswith('isa0060/serio')]
+    if len(internal) == 1:
+        return internal[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    choices = '; '.join(f'{path} ({name})' for path, name, _ in candidates)
+    raise RuntimeError('Multiple keyboards found: ' + choices +
+                       '. Use --device to select the intended keyboard.')
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--list',action='store_true',help='List eligible physical keyboard event devices')
-    ap.add_argument('--device',help='Path to /dev/input/by-id/...-event-kbd or /dev/input/eventN')
+    ap.add_argument('--device',help='Override automatic selection with /dev/input/by-id/...-event-kbd or /dev/input/eventN')
     ap.add_argument('--adapter',default='hci0')
     ap.add_argument('--name',default='ServerKeyZ',help='HID service name; set adapter alias separately')
     ap.add_argument('--peer',type=str.upper,help='Optional allowlist: one host Bluetooth MAC')
@@ -215,18 +251,21 @@ def main():
     try:
         import evdev
     except ImportError: ap.error('Install python3-evdev (see README).')
-    def suitable(d): return {30,43,29,56,125}.issubset(set(d.capabilities().get(1,[]))) or {30,43,97,100,126}.issubset(set(d.capabilities().get(1,[])))
     if args.list:
-        for path in evdev.list_devices():
-            with evdev.InputDevice(path) as d:
-                if suitable(d): print(f'{path}\t{d.name}\t{d.phys}')
+        for path, name, phys in find_keyboards(evdev):
+            print(f'{path}\t{name}\t{phys}')
         return 0
-    if not args.device: ap.error('Choose a keyboard with --list, then provide --device.')
     if os.geteuid()!=0: ap.error('Run with sudo for input and Bluetooth access.')
+    if not args.device:
+        try:
+            args.device, name, _ = choose_keyboard(find_keyboards(evdev))
+        except RuntimeError as e:
+            ap.error(str(e))
+        print(f'Auto-selected keyboard: {name} ({args.device})',flush=True)
     try:
         import dbus
         from gi.repository import GLib
-        with evdev.InputDevice(args.device) as keyboard:
+        with closing(evdev.InputDevice(args.device)) as keyboard:
             if not suitable(keyboard): raise RuntimeError('Selected device does not expose required keyboard keys.')
             run(args,keyboard,dbus,GLib)
     except KeyboardInterrupt: pass
