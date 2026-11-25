@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Forward one automatically detected or explicitly selected Linux keyboard to a paired Bluetooth HID host."""
-import argparse, os, re, select, signal, socket, sys, time
+import argparse, errno, fcntl, os, re, select, signal, socket, subprocess, sys, time
 from contextlib import ExitStack, closing
 from xml.sax.saxutils import quoteattr
 from hid import REPORT_MAP, State, reports
+from bluetooth_setup import (ADAPTER, DEVICE, AGENT_PATH, PairingPolicy, make_agent,
+    keyboard_class, read_class, set_class, restore_adapter, resolve_conflict, restore_runtime, command)
 
 UUID='00001124-0000-1000-8000-00805f9b34fb'
 PATH='/org/serverkeyz/keyboard'
@@ -57,6 +59,23 @@ def control(s, packet, current):
     return True
 
 def run(args, keyboard, dbus, GLib):
+    with ExitStack() as outer:
+        # The lock is released even when the process crashes.
+        lock=outer.enter_context(open('/run/lock/serverkeyz.lock','a'))
+        try: fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('ServerKeyZ is already running.')
+        command('systemctl', 'start', 'bluetooth.service')
+        for attempt in range(2):
+            try:
+                with ExitStack() as session:
+                    run_session(args, keyboard, dbus, GLib, session)
+                return
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE or attempt: raise
+                resolve_conflict(outer)
+
+
+def run_session(args, keyboard, dbus, GLib, setup):
     import dbus.service
     from dbus.mainloop.glib import DBusGMainLoop
     DBusGMainLoop(set_as_default=True)
@@ -64,15 +83,44 @@ def run(args, keyboard, dbus, GLib):
     root=dbus.Interface(bus.get_object(BLUEZ,'/'),'org.freedesktop.DBus.ObjectManager')
     adapter_path='/org/bluez/'+args.adapter
     props=dbus.Interface(bus.get_object(BLUEZ,adapter_path),'org.freedesktop.DBus.Properties')
-    adapter=props.GetAll('org.bluez.Adapter1')
-    if not adapter['Powered']: raise RuntimeError('Adapter is off; use bluetoothctl power on.')
+    adapter=props.GetAll(ADAPTER)
+    index=int(args.adapter[3:])
+    original_class=read_class(index)
+    setup.callback(restore_adapter,props,adapter,dbus,index,original_class)
+    if not adapter['Powered']: props.Set(ADAPTER,'Powered',dbus.Boolean(True))
     addr=str(adapter['Address'])
-    def authorized(peer):
+    policy=PairingPolicy(adapter_path,args.peer)
+    def device_info(path):
+        return root.GetManagedObjects().get(path,{}).get(DEVICE,{})
+    def peer_info(peer):
         for p,ifs in root.GetManagedObjects().items():
-            d=ifs.get('org.bluez.Device1',{})
+            d=ifs.get(DEVICE,{})
             if str(p).startswith(adapter_path+'/') and str(d.get('Address','')).upper()==peer:
-                return bool(d.get('Paired') and d.get('Trusted') and (not args.peer or args.peer==peer))
-        return False
+                return p,d
+        return None,{}
+    def authorized(peer, approve=False):
+        p,d=peer_info(peer)
+        if not p or not d.get('Paired') or not policy.allowed(p,peer): return False
+        if approve and policy.approved!=peer:
+            if not policy.approve(p,peer,str(d.get('Alias','Bluetooth host'))): return False
+        if policy.approved!=peer: return False
+        if approve and not d.get('Trusted'):
+            dbus.Interface(bus.get_object(BLUEZ,p),'org.freedesktop.DBus.Properties').Set(DEVICE,'Trusted',dbus.Boolean(True))
+            return True
+        return bool(d.get('Trusted'))
+    def stop_discovery():
+        policy.pairing_open=False
+        props.Set(ADAPTER,'Discoverable',dbus.Boolean(False))
+        props.Set(ADAPTER,'Pairable',dbus.Boolean(False))
+    agent=make_agent(dbus,bus,policy,device_info)
+    am=dbus.Interface(bus.get_object(BLUEZ,'/org/bluez'),'org.bluez.AgentManager1')
+    am.RegisterAgent(AGENT_PATH,'KeyboardDisplay')
+    def unregister_agent():
+        try: am.UnregisterAgent(AGENT_PATH)
+        except dbus.DBusException: pass
+        agent.remove_from_connection()
+    setup.callback(unregister_agent)
+    am.RequestDefaultAgent(AGENT_PATH)
     class Profile(dbus.service.Object):
         ended=False
         disconnect_requested=False
@@ -85,11 +133,12 @@ def run(args, keyboard, dbus, GLib):
         @dbus.service.method('org.bluez.Profile1',in_signature='o',out_signature='')
         def RequestDisconnection(self,device): self.disconnect_requested=True
     profile=Profile(bus,PATH)
+    setup.callback(profile.remove_from_connection)
     manager=dbus.Interface(bus.get_object(BLUEZ,'/org/bluez'),'org.bluez.ProfileManager1')
     with ExitStack() as stack:
         for psm in (17,19):
             try: s=listen(addr,psm)
-            except OSError as e: raise RuntimeError(f'Cannot bind HID PSM {psm}: {e}. See README BlueZ conflict instructions.') from e
+            except OSError as e: raise OSError(e.errno, f'Cannot bind HID PSM {psm}: {e}') from e
             stack.enter_context(s)
             if psm==17: lc=s
             else: li=s
@@ -98,7 +147,25 @@ def run(args, keyboard, dbus, GLib):
             try: manager.UnregisterProfile(PATH)
             except dbus.DBusException: pass
         stack.callback(unregister)
-        print(f'Listening on {args.adapter} ({addr}). Keyboard is local until a trusted host connects.',flush=True)
+        # BlueZ may change the class when a profile is registered; set it last.
+        props.Set(ADAPTER,'Alias',dbus.String(args.name))
+        props.Set(ADAPTER,'DiscoverableTimeout',dbus.UInt32(args.pair_timeout))
+        props.Set(ADAPTER,'PairableTimeout',dbus.UInt32(args.pair_timeout))
+        set_class(index,0x0540)
+        props.Set(ADAPTER,'Pairable',dbus.Boolean(True))
+        props.Set(ADAPTER,'Discoverable',dbus.Boolean(True))
+        for _ in range(10):
+            actual=props.GetAll(ADAPTER)
+            cod=read_class(index)
+            if keyboard_class(cod) and actual['Discoverable'] and actual['Pairable'] and UUID in [str(u).lower() for u in actual['UUIDs']]:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f'Bluetooth setup verification failed: class={cod:#08x}, discoverable={actual["Discoverable"]}, pairable={actual["Pairable"]}, UUIDs={list(actual["UUIDs"])}')
+        print(f'Bluetooth keyboard {args.name} is discoverable (class {cod:#08x}, HID registered).',flush=True)
+        print(f'Open Bluetooth settings on the target, select {args.name}, and approve pairing in THIS terminal.',flush=True)
+        print(f'Listening on {args.adapter} ({addr}). Keyboard remains local until an approved host connects.',flush=True)
+        pair_until=time.monotonic()+args.pair_timeout
         print(r'Super + Ctrl + Alt + \ toggles local / Bluetooth mode. Ctrl+C in SSH stops the app.',flush=True)
         channels={}; peer=None; deadline=0; check_at=0
         state=State(keyboard.active_keys()); grabbed=False
@@ -153,6 +220,9 @@ def run(args, keyboard, dbus, GLib):
                 profile.disconnect_requested=False
                 if channels: close_session(disconnected=True)
             now=time.monotonic()
+            if policy.pairing_open and now>=pair_until:
+                stop_discovery()
+                print("Pairing window expired. Restart ServerKeyZ to pair a new host.",flush=True)
             if channels and len(channels)<2 and now>deadline:
                 close_session()
             if len(channels)==2 and now>=check_at:
@@ -180,10 +250,11 @@ def run(args, keyboard, dbus, GLib):
                 except BlockingIOError: continue
                 remote=remote[0].upper()
                 try:
-                    if not authorized(remote) or (peer is not None and remote!=peer) or listener in channels:
-                        print(f'Rejected {remote}: pair and trust selected host first, then reconnect.',flush=True); c.close(); continue
+                    if (peer is not None and remote!=peer) or listener in channels or not authorized(remote,approve=True):
+                        print(f'Rejected {remote}: host not paired/approved; finish pairing and reconnect.',flush=True); c.close(); continue
                     c.settimeout(0.5); channels[listener]=c; peer=remote; deadline=time.monotonic()+15
                     if len(channels)==2:
+                        if policy.pairing_open: stop_discovery()
                         print(f'Connected to {peer}. '+('Release all keys to activate remote mode.' if state.remote else 'Local mode remains active until shortcut is pressed.'),flush=True)
                         check_at=0
                 except BaseException: c.close(); raise
@@ -243,9 +314,21 @@ def main():
     ap.add_argument('--list',action='store_true',help='List eligible physical keyboard event devices')
     ap.add_argument('--device',help='Override automatic selection with /dev/input/by-id/...-event-kbd or /dev/input/eventN')
     ap.add_argument('--adapter',default='hci0')
-    ap.add_argument('--name',default='ServerKeyZ',help='HID service name; set adapter alias separately')
+    ap.add_argument('--name',default='ServerKeyZ',help='Bluetooth keyboard name')
+    ap.add_argument('--pair-timeout',type=int,default=180,help='Discovery/pairing window in seconds (default 180)')
+    ap.add_argument('--restore-bluetooth',action='store_true',help='Remove a stale temporary ServerKeyZ BlueZ override and restart Bluetooth')
     ap.add_argument('--peer',type=str.upper,help='Optional allowlist: one host Bluetooth MAC')
     args=ap.parse_args()
+    if not 30 <= args.pair_timeout <= 900: ap.error('--pair-timeout must be 30–900 seconds')
+    if args.restore_bluetooth:
+        if os.geteuid()!=0: ap.error('Run with sudo.')
+        try:
+            with open('/run/lock/serverkeyz.lock','a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                restore_runtime()
+        except (OSError,RuntimeError,subprocess.TimeoutExpired) as e:
+            print(f'Error: {e}',file=sys.stderr); return 1
+        print('Temporary override cleared.',flush=True); return 0
     if args.peer and not re.fullmatch(r'([0-9A-F]{2}:){5}[0-9A-F]{2}',args.peer): ap.error('Invalid peer MAC')
     if not re.fullmatch(r'hci[0-9]+',args.adapter): ap.error('Invalid adapter')
     try:
@@ -269,7 +352,9 @@ def main():
             if not suitable(keyboard): raise RuntimeError('Selected device does not expose required keyboard keys.')
             run(args,keyboard,dbus,GLib)
     except KeyboardInterrupt: pass
-    except (OSError,RuntimeError,ImportError) as e: print(f'Error: {e}',file=sys.stderr); return 1
+    except (OSError,RuntimeError,ImportError,subprocess.TimeoutExpired) as e: print(f'Error: {e}',file=sys.stderr); return 1
+    except Exception as e:
+        print(f'Bluetooth/setup error: {type(e).__name__}: {e}',file=sys.stderr); return 1
     finally: print('Local keyboard control restored (app stopped).',flush=True)
     return 0
 

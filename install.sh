@@ -8,5 +8,6 @@ apt-get install -y bluez python3 python3-evdev python3-dbus python3-gi
 install -d -m 0755 /usr/local/lib/ServerKeyZ /usr/local/bin
 install -m 0755 serverkeyz.py /usr/local/lib/ServerKeyZ/
 install -m 0644 hid.py /usr/local/lib/ServerKeyZ/
+install -m 0644 bluetooth_setup.py /usr/local/lib/ServerKeyZ/
 install -m 0755 serverkeyz /usr/local/bin/serverkeyz
-printf '\nInstalled. Next: sudo serverkeyz\nRead README.md for required Bluetooth setup and pairing.\n'
+printf '\nInstalled. Next: sudo serverkeyz\nBluetooth setup and pairing are handled by the app.\n'

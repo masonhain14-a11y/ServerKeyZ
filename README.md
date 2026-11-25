@@ -1,163 +1,80 @@
 # ServerKeyZ
 
-A small Linux command-line app that turns one physical keyboard connected to your server into a Bluetooth Classic HID keyboard. It forwards real key presses to a compatible paired phone, computer, tablet or TV. No companion app is required on the receiving device.
+Turn a Linux server’s physical keyboard into a Bluetooth Classic HID keyboard. Switch between local and wireless input using **Super + Ctrl + Alt + `\`**. No companion app required on a compatible receiving device.
 
-**Version 0.3 — hardware validation pending.** Intended for Debian/Ubuntu with BlueZ 5 and a Bluetooth Classic (BR/EDR) capable adapter. Not a BLE-only keyboard, Windows or macOS server app. No Samsung-specific control protocol is implemented.
+**v0.4 — automatic Bluetooth setup.** Designed for Debian 13 / Ubuntu with BlueZ 5, systemd and a BR/EDR-capable adapter. Hardware pairing is not yet validated; this is an experimental release.
 
-## Behavior
+## Installation
 
-- Local keyboard remains usable while waiting for a host. Bluetooth mode is initially requested, but activates only after a paired, trusted host opens both encrypted HID channels and all physical keys are released.
-- **Super (Windows) + Ctrl + Alt + backslash (`\`)** toggles between local and Bluetooth mode. Hold the three modifiers, press the physical backslash key, then release all keys. Left/right modifiers work. Holding the chord or repeating backslash cannot cause multiple toggles until all keys are released.
-- Bluetooth to local: remote key reports are cleared immediately and no more typing is forwarded. After releasing the keys, the physical keyboard is ungrabbed and works normally on the server. The Bluetooth connection and app remain active.
-- Local to Bluetooth: the same shortcut requests remote mode; the keyboard is grabbed only after all keys are released and a trusted host is connected. If none is connected yet, it waits with local input intact. Because local mode does not grab or replace your physical keyboard, the shortcut also reaches the server's desktop/console in local mode. Avoid assigning the same chord to another local action.
-- The backslash that triggers the shortcut is never forwarded; modifiers pressed before the final key may already have reached the remote host. Remote mode forwards standard keyboard and media reports only while enabled.
-- A host disconnect or failed HID write releases the physical keyboard and switches to local mode. The app keeps listening; press the shortcut to request Bluetooth mode again. Ctrl+C in the launching SSH terminal, SIGTERM, or a fatal input error stops the app and releases the physical keyboard. No service auto-starts or auto-restarts it.
-- Standard keys, navigation, function keys, keypad, modifiers, volume/mute and basic playback media keys are supported. Actual media key behavior and layouts are determined by the receiving host. Consumer report carries one media usage at a time. Separate media-key event devices aren't forwarded.
-- Only a paired and explicitly trusted BlueZ device may receive input. Use `--peer` to restrict it to one particular device (recommended). No keystrokes are logged, saved or accepted from the network. Keep your server unlocked only when you intend to forward input.
-
-## 1. Install
-
-Upload the contents of this directory to your own GitHub repository. On the server:
-
-```sh
-git clone https://github.com/YOUR-USERNAME/ServerKeyZ.git
+```bash
+git clone https://github.com/masonhain14-a11y/ServerKeyZ.git
 cd ServerKeyZ
-sudo ./install.sh
-```
-
-The installer installs distribution packages and copies the program under `/usr/local/lib/ServerKeyZ/` and a launcher to `/usr/local/bin/serverkeyz`. It does not change Bluetooth configuration or restart services. On other Linux distributions, install equivalent packages (`bluez`, Python 3, `evdev`, `dbus-python`, PyGObject/GLib) and run `sudo python3 serverkeyz.py` from the source directory.
-
-Check your server:
-
-```sh
-cat /etc/os-release
-bluetoothctl list
-sudo btmgmt info
-sudo serverkeyz --list
-```
-
-Confirm that the controller supports BR/EDR. For a reliable keyboard path, use:
-
-```sh
-ls -l /dev/input/by-id/*-event-kbd
-```
-
-For a manual override, choose the entry that matches the intended keyboard; otherwise use an event device from `--list`. Event numbers can change after reboot. The app does not grab all input devices. Keep an SSH session open for recovery.
-
-### Upgrade from an earlier version
-
-Replace the old repository contents with the 0.3 release, then on the server stop the old app (Ctrl+C in its SSH terminal), and run:
-
-```sh
-cd ServerKeyZ
-git pull
-sudo ./install.sh
-```
-
-Relaunch with `sudo serverkeyz`; optional `--device` and `--peer` arguments are still supported. Existing BlueZ pairing and configuration are not changed by the installer.
-
-## 2. Bluetooth setup (Classic HID conflict)
-
-Linux BlueZ commonly claims the Classic HID ports (PSMs 17 and 19) for its own host role. ServerKeyZ needs these ports for the opposite role. If launch fails to bind either port or reports a duplicate HID profile, disable only the BlueZ `input` plugin. **This is a system-wide change: it can prevent ordinary Bluetooth keyboards/mice from working on the server; restarting Bluetooth disconnects active Bluetooth devices. Use a wired keyboard and SSH.** If you depend on server Bluetooth peripherals, do not make this change without a recovery plan.
-
-Inspect your service first:
-
-```sh
-systemctl cat bluetooth.service
-```
-
-Find the effective `ExecStart` path and existing arguments. For example, if it is `/usr/libexec/bluetooth/bluetoothd`, create a dedicated drop-in with that path:
-
-```sh
-sudo mkdir -p /etc/systemd/system/bluetooth.service.d
-sudoedit /etc/systemd/system/bluetooth.service.d/90-serverkeyz.conf
-```
-
-Put the following in that file, using the actual executable path and preserving any existing required daemon options. If your daemon already has a `--noplugin` list, add `input` to that list instead of replacing it.
-
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=input
-```
-
-Then:
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl restart bluetooth.service
-bluetoothctl power on
-```
-
-To undo only this change:
-
-```sh
-sudo rm /etc/systemd/system/bluetooth.service.d/90-serverkeyz.conf
-sudo systemctl daemon-reload
-sudo systemctl restart bluetooth.service
-```
-
-On a dedicated adapter, `btmgmt --index hci0 class 5 64` may help a host identify the peripheral as a keyboard. This changes the adapter's advertised device class; it is optional, may be overridden by BlueZ, and should not be used blindly on a shared adapter. Check the actual controller and use `--adapter hci1` if needed. The input plugin change is still global.
-
-## 3. Start and pair
-
-In an SSH terminal:
-
-```sh
+sudo bash install.sh
 sudo serverkeyz
 ```
 
-The app automatically selects a unique built-in PS/2 keyboard, or a single eligible physical keyboard if no built-in PS/2 keyboard is found. If several keyboards are present and there is no unique built-in PS/2 keyboard, it asks you to select one using `--device`. To override automatic selection, use `sudo serverkeyz --device /dev/input/event3` with your own path.
+Already installed? Stop the running app with Ctrl+C in its launch terminal, then:
 
-The app registers the HID service, but does not make the adapter discoverable itself. In a second SSH terminal, use the interactive BlueZ shell:
-
-```text
-bluetoothctl
-power on
-system-alias ServerKeyZ
-agent KeyboardDisplay
-default-agent
-pairable on
-discoverable on
+```bash
+cd ~/ServerKeyZ
+git pull
+sudo bash install.sh
+sudo serverkeyz
 ```
 
-If using a non-default adapter, use `list` then `select <controller-MAC>` before those commands. Keep the shell open for pairing prompts. In the receiving device's Bluetooth settings, select **ServerKeyZ** and follow the pairing/passkey prompts in both devices. If a passkey is displayed by the receiving device, enter it in the agent prompt as requested, not by sending blind keystrokes.
+The installer installs distribution dependencies and copies the app to `/usr/local/lib/ServerKeyZ` and the launcher to `/usr/local/bin/serverkeyz`. Run it once per update. Keep the existing repository MIT LICENSE when uploading this update.
 
-In the BlueZ shell, run `devices`, then `info <HOST-MAC>` and `trust <HOST-MAC>` for the device you just approved. `Paired: yes` and `Trusted: yes` must both be present. Initial HID connection can be rejected before trust is set: reconnect from the receiving device after trust is set. Do not trust unknown devices. Turn off discovery and pairing after setup:
+## Connect a device
 
-```text
-discoverable off
-pairable off
-quit
-```
+1. Run `sudo serverkeyz` in an interactive SSH terminal (or on the server with a wired keyboard).
+2. Wait for the message `Bluetooth keyboard ServerKeyZ is discoverable`.
+3. Open Bluetooth settings on the device you want to control and select **ServerKeyZ**.
+4. Approve the named device in the same server terminal by entering `y` when prompted. Follow any PIN/passkey instructions in the terminal and on the receiving device. If pairing succeeds but the first HID connection fails, select Connect again on the receiving device.
+5. `REMOTE MODE` confirms both HID channels connected and keyboard forwarding is active. Test in a harmless text editor.
 
-For normal use, restart the app with the known host address:
+No separate `bluetoothctl`, `btmgmt`, agent, trust or discovery commands are normally needed. A host must be paired and explicitly approved; only the approved host can receive input during that launch. Discovery and pairing close after a successful HID connection or 180 seconds, whichever comes first. Restart the app to open a new pairing window. Use `--pair-timeout 300` for a longer window. A previously paired device may still require approval when restarting the app. Pairing requires an interactive terminal, not an unattended daemon.
 
-```sh
-sudo serverkeyz --peer AA:BB:CC:DD:EE:FF
-```
+## Controls
 
-Replace the example host MAC. Connect from the host Bluetooth settings. `REMOTE MODE` in the server terminal confirms both HID channels opened and keyboard capture succeeded. Release all physical keys during activation. Press Super+Ctrl+Alt+backslash on the selected physical keyboard to toggle to local mode. Release the keys, then press the same shortcut again to return to Bluetooth mode. The app stays running in both modes. To quit completely, press Ctrl+C in the launching SSH terminal.
+| Command or shortcut | Function |
+| --- | --- |
+| `sudo serverkeyz` | Auto-select keyboard, configure Bluetooth and start |
+| Super + Ctrl + Alt + backslash | Toggle local / wireless input on physical server keyboard |
+| Ctrl+C in SSH | Stop app and release keyboard |
+| `sudo serverkeyz --list` | List eligible keyboards |
+| `sudo serverkeyz --device /dev/input/event0` | Override keyboard selection |
+| `sudo serverkeyz --adapter hci1` | Use another adapter |
+| `sudo serverkeyz --peer AA:BB:CC:DD:EE:FF` | Restrict pairing and input to one host |
+| `sudo serverkeyz --restore-bluetooth` | Clear stale app-created temporary service override (stop app first) |
 
-## Troubleshooting / limitations
+The app prioritizes a unique built-in PS/2 keyboard or a single eligible keyboard. If ambiguous, specify a device. Keyboard event numbers may change after reboot. Local input is available while waiting for a host. The hotkey requires releasing all keys before the mode switches; modifier key presses before the final backslash may have already reached the receiver. The chord also reaches the local OS in local mode. A host disconnect returns input to local mode and disarms forwarding; reconnect the host and toggle to re-enable it. The app remains running. No key logging.
 
-- `Address already in use` or profile registration conflict: see step 2. Don't kill unrelated Bluetooth processes.
-- App is waiting: confirm the host supports Bluetooth Classic keyboards, pairing/trust are complete, the selected adapter is correct, and initiate connection from the host. Some hosts only support BLE HID or require different HID negotiation/reconnection behavior. This is not a complete HID conformance implementation (report protocol only; no boot protocol, keyboard LED synchronization, or host idle-rate support).
-- A target may not appear as a keyboard if the Bluetooth device class is not appropriate. See the optional class note in step 2.
-- A Samsung soundbar usually is not a general-purpose keyboard host; this app is for targets which explicitly support Bluetooth HID keyboards, e.g. some Samsung TVs. Even a TV may not route keyboard media keys to its soundbar. Compatibility is model-dependent.
-- Recovery from SSH: `sudo pkill -TERM -f '/usr/local/lib/ServerKeyZ/serverkeyz.py'`. Linux releases an evdev grab when the process/file descriptor closes. If all else fails, from a different keyboard or SSH terminate the process. No service auto-restarts it.
-- To uninstall the app, remove `/usr/local/bin/serverkeyz` and `/usr/local/lib/ServerKeyZ/` (only those paths), and undo the optional Bluetooth drop-in as above. The alias and pairing/trust state are separate BlueZ settings; change/remove them manually if desired.
+## Automatic Bluetooth configuration
 
-## Tests
+On launch ServerKeyZ starts BlueZ, powers the selected adapter, registers the Classic HID SDP service and pairing agent, sets the alias and keyboard device class, and opens discovery. It verifies the kernel device class, BlueZ HID UUID, pairable and discoverable flags before reporting ready. Normal exit restores the previous adapter settings where possible and unregisters the agent and profile. Bluetooth bonds/trust established with your approval remain in BlueZ.
 
-```sh
+If the HID ports are occupied, the app attempts to temporarily disable the BlueZ `input` plugin using a runtime systemd drop-in. It does so only for a standard bluetoothd service without custom flags. It then restarts BlueZ and retries. **This may disconnect existing Bluetooth devices and temporarily disable normal Bluetooth keyboard/mouse input to the server.** Use SSH or a wired keyboard. On exit, the runtime drop-in is removed and BlueZ is restarted. Earlier manually installed overrides are preserved, not replaced or removed. A customized service or an unrelated process occupying the ports may require investigation. `--restore-bluetooth` removes only the app’s own runtime override if left after an abnormal stop. It does not remove any older persistent override. A power loss or SIGKILL may prevent normal settings cleanup.
+
+## Troubleshooting
+
+- Not discoverable: copy the entire output of `sudo serverkeyz`, including verification errors. The checks confirm local adapter state, not actual radio visibility on the Mac. Try refreshing Bluetooth settings on the receiving device once after startup. Restart the app if discovery has timed out.
+- A previously paired device that will not reconnect: forget ServerKeyZ on the receiving device and restart ServerKeyZ. If still failing, the old bond on the server may also need removal; do not remove unrelated devices.
+- If the app reports an occupied port and customized service, inspect `systemctl cat bluetooth.service`. The app refuses to overwrite customized daemon options automatically. For this server the previously created `/etc/systemd/system/bluetooth.service.d/serverkeyz.conf` already disables the input plugin; leave it in place while testing.
+- Bluetooth adapter supports Classic HID transport, but macOS/other hosts may still reject an incomplete HID implementation. Report protocol is implemented, not boot protocol; keyboard LEDs and idle rate are not synchronized. BLE-only receivers are not supported.
+- A Samsung soundbar is generally not a keyboard host. Some TVs may accept keyboard volume/media keys, but routing to a soundbar is model-dependent.
+- Emergency recovery: stop the app from SSH using Ctrl+C or `sudo pkill -TERM -f '/usr/local/lib/ServerKeyZ/serverkeyz.py'`. Linux releases the physical keyboard when the device file closes. For stale temporary service overrides, use `sudo serverkeyz --restore-bluetooth`.
+
+## Testing
+
+```bash
 python3 -m unittest discover -s tests -v
 ```
 
-These test automatic keyboard selection, report encoding, release packets, SDP XML, both shortcut directions, held-key suppression and disconnect disarming without Bluetooth hardware. Real adapter pairing, host compatibility and latency still need on-device testing. First test with a harmless text editor on a compatible host and SSH available, including both shortcut directions, held keys, and disconnect/reconnect recovery.
+Unit tests cover keyboard selection, HID reports, shortcut behavior, disconnect safety, pairing approval policy, keyboard classification and reversible service override logic. These do not exercise physical Bluetooth radios, actual macOS pairing, live BlueZ D-Bus calls or live systemd service restarts.
 
-## Technical references
+## References
 
+- [BlueZ Adapter API](https://github.com/bluez/bluez/blob/master/doc/org.bluez.Adapter.rst)
+- [BlueZ Agent API](https://github.com/bluez/bluez/blob/master/doc/org.bluez.Agent.rst)
 - [BlueZ ProfileManager API](https://github.com/bluez/bluez/blob/master/doc/org.bluez.ProfileManager.rst)
-- [BlueZ profile implementation](https://kernel.googlesource.com/pub/scm/bluetooth/bluez.git/+/refs/tags/5.85/src/profile.c)
-- [Classic HID keyboard emulator architecture](https://github.com/SySS-Research/bluetooth-keyboard-emulator)
+- [BlueZ management interface](https://github.com/bluez/bluez/wiki/MGMT)
